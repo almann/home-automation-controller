@@ -19,8 +19,10 @@ Running the command is as follows:
 
 `TABLE-NAME` is the DynamoDB state table, the `ID` provided will store operational state as a binary field in DynamoDB named `state`.  This binary field is ZLIB compressed JSON.  The contoller uses this state to manage itself, but really it is intended for another application to dashboard.  The SQS queue named `QUEUE-NAME` is used to dispatch commands to the controller.  These commands are JSON and are formatted as:
 
-    {"id":"banana", "type":"light", "value":"on"}
+    {"id":"banana", "type":"lamp", "value":"on"}
 
 The above command sent to SQS would be interpreted by the controller if it were initialized with the `ID` of `banana`.  The reason for the `id` field is multiplexing commands over SNS to SQS for a network of these controllers throughout the house.  Another concept to be added later might be a `group` for rooms with sets of controllers.
 
 Note that root is required to interface with the GPIO pins.
+
+My recommendation is to create a unique user in AWS (AWS Identity and Access Management), and grant only the permissions you need to that account.

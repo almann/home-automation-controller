@@ -20,6 +20,12 @@ import boto.dynamodb2.fields
 
 import boto.sqs             as sqs
 
+import logging
+from   logging              import warning as warn
+from   logging              import debug
+from   logging              import info
+from   logging              import error
+
 _AWS_REGION = "us-west-2"
 
 _AC_RELAY_PIN = 4
@@ -114,13 +120,13 @@ def ac_toggle(pin) :
 
 def command_proc_func(sqs_queue_name, control_queue, termination_flag) :
     '''Command queue for SQS commands'''
+    info('Initializing SQS command processor...')
     sqs_conn = sqs.connect_to_region(_AWS_REGION)
     sqs_queue = sqs_conn.get_queue(sqs_queue_name)
     sqs_queue.set_message_class(sqs.message.RawMessage)
-    print >> sys.stderr, 'Initializing Command Queue...'
     while not termination_flag.value :
         messages = sqs_queue.get_messages(10, wait_time_seconds = 20)
-        print >> sys.stderr, 'Read %d messages from SQS' % len(messages)
+        info('Read %d messages from SQS' % len(messages))
         for message in messages :
             command = message.get_body()
             control_queue.put(command)
@@ -131,6 +137,12 @@ def main(args) :
     if len(args) != 4 :
         print >> sys.stderr, 'USAGE: %s TABLE QUEUE ID' % args[0]
         sys.exit(2)
+    # logging
+    logging.basicConfig(
+        format = '%(asctime)s %(levelname)-8s%(funcName)-20s %(message)s',
+        level = logging.INFO
+    )
+
     # args
     state_table_name = args[1]
     command_queue_name = args[2]
@@ -147,6 +159,7 @@ def main(args) :
     p_command.start()
 
     # operational table
+    info('Initializing DDB backed operational state...')
     state = State(state_table_name, unit_id)
 
     # GPIO setup
@@ -160,12 +173,12 @@ def main(args) :
 
         # command jump table via the class/lexical closure
         class CommandProcessor(object) :
-            def light(self, val) :
+            def lamp(self, val) :
                 if val == 'on' :
-                    print >> sys.stderr, 'Turning on light via command'
+                    info('Turning on lamp via command')
                     lamp.enable(True)
                 elif val == 'off' :
-                    print >> sys.stderr, 'Turning off light via command'
+                    info('Turning off lamp via command')
                     lamp.enable(False)
             def noop(self, val) :
                 pass
@@ -174,6 +187,7 @@ def main(args) :
         # event loop
         event_count = 0
         motion_count = 0
+        info('Starting main event loop...')
         while True :
             try :
                 event_count += 1
@@ -183,7 +197,8 @@ def main(args) :
                     pir_led.enable(True)
                     # turn on lamp
                     if not lamp.is_enabled :
-                        ok = lamp.enable(True)
+                        if lamp.enable(True) :
+                            info('Turning on lamp via motion')
                         state.update_lamp(True)
 
                 elif event_count == 1 :
@@ -192,7 +207,7 @@ def main(args) :
                 # get commands
                 try :
                     command_str = control_queue.get_nowait()
-                    print >> sys.stderr, 'Received command: %s' % command_str
+                    info('Received command: %s' % command_str)
                     command = json.loads(command_str)
                     if command.get('id', None) == unit_id :
                         command_func = getattr(command_processor, command.get('type', ''), command_processor.noop)
@@ -202,24 +217,26 @@ def main(args) :
                 
                 # flush event
                 if event_count >= _LOG_FREQ :
-                    print >> sys.stderr, 'Detected %d/%d events in %0.2f seconds' \
-                            % (motion_count, event_count, _LOG_TIME)
+                    info('Detected %d/%d events in %0.2f seconds' \
+                            % (motion_count, event_count, _LOG_TIME))
                     state.update_motion(motion_count > 0)
                     # turn off lamp
                     if state.pir_state == 'IDLE' \
                             and state.pir_last_updated_secs > _IDLE_AC_TURNOFF_TIME \
                             and lamp.is_enabled:
-                        print >> sys.stderr, 'Idle for %0.2fs, shutting off lamp' % state.pir_last_updated_secs 
+                        info('Idle for %0.2fs, shutting off lamp' % state.pir_last_updated_secs)
                         lamp.enable(False)
                         state.update_lamp(False)
 
                     event_count = 0
                     motion_count = 0
 
-                error_led.enable(False)
+                if error_led.is_enabled :
+                    info('Event loop succeeded, switching error LED off')
+                    error_led.enable(False)
                 time.sleep(_SLEEP_TIME)
             except :
-                traceback.print_exc()
+                error('Event loop error', exc_info = True)
                 error_led.enable(True)
                 if sys.exc_info()[0] is KeyboardInterrupt :
                     raise sys.exc_info()[1]
