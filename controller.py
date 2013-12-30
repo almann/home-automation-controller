@@ -173,15 +173,15 @@ def main(args) :
 
         # command jump table via the class/lexical closure
         class CommandProcessor(object) :
-            def lamp(self, val) :
+            def cmd_lamp(self, val) :
                 if val == 'on' :
                     info('Turning on lamp via command')
                     lamp.enable(True)
                 elif val == 'off' :
                     info('Turning off lamp via command')
                     lamp.enable(False)
-            def noop(self, val) :
-                pass
+                else :
+                    warn('Invalid lamp command value: %s' % val)
         command_processor = CommandProcessor()
 
         # event loop
@@ -209,9 +209,19 @@ def main(args) :
                     command_str = control_queue.get_nowait()
                     info('Received command: %s' % command_str)
                     command = json.loads(command_str)
-                    if command.get('id', None) == unit_id :
-                        command_func = getattr(command_processor, command.get('type', ''), command_processor.noop)
-                        command_func(command['value'])
+                    command_unit_id = command.get('id', None)
+                    if command_unit_id == unit_id :
+                        command_type = command.get('type', None)
+                        if command_type == None :
+                            warn('No command type specified')
+                        else :
+                            command_func = getattr(command_processor, 'cmd_%s' % command_type, None)
+                            if command_func is None :
+                                warn('Unknown command: %s' % command_type)
+                            else :
+                                command_func(command['value'])
+                    else :
+                        info('Ignoring command for unit: %s' % command_unit_id)
                 except queue.Empty :
                     pass
                 
