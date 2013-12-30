@@ -158,6 +158,7 @@ def main(args) :
         pir_led = led_toggle(_GREEN_LED_PIN)
         lamp = ac_toggle(_AC_RELAY_PIN)
 
+        # command jump table via the class/lexical closure
         class CommandProcessor(object) :
             def light(self, val) :
                 if val == 'on' :
