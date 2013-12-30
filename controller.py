@@ -112,7 +112,7 @@ def led_toggle(pin) :
 def ac_toggle(pin) :
     return Toggle(pin, _AC_RELAY_MIN_TOGGLE_TIME)
 
-def p_command_func(sqs_queue_name, control_queue, termination_flag) :
+def command_proc_func(sqs_queue_name, control_queue, termination_flag) :
     '''Command queue for SQS commands'''
     sqs_conn = sqs.connect_to_region(_AWS_REGION)
     sqs_queue = sqs_conn.get_queue(sqs_queue_name)
@@ -141,7 +141,7 @@ def main(args) :
 
     # spawn off command process
     p_command = mp.Process(
-        target = p_command_func,
+        target = command_proc_func,
         args = (command_queue_name, control_queue, termination_flag)
     )
     p_command.start()
@@ -157,6 +157,18 @@ def main(args) :
         error_led = led_toggle(_RED_LED_PIN)
         pir_led = led_toggle(_GREEN_LED_PIN)
         lamp = ac_toggle(_AC_RELAY_PIN)
+
+        class CommandProcessor(object) :
+            def light(self, val) :
+                if val == 'on' :
+                    print >> sys.stderr, 'Turning on light via command'
+                    lamp.enable(True)
+                elif val == 'off' :
+                    print >> sys.stderr, 'Turning off light via command'
+                    lamp.enable(False)
+            def noop(self, val) :
+                pass
+        command_processor = CommandProcessor()
 
         # event loop
         event_count = 0
@@ -181,12 +193,9 @@ def main(args) :
                     command_str = control_queue.get_nowait()
                     print >> sys.stderr, 'Received command: %s' % command_str
                     command = json.loads(command_str)
-                    # TODO clean this up
-                    if command['type'] == 'light' :
-                        if command['value'] == 'on' :
-                            lamp.enable(True)
-                        elif command['value'] == 'off' :
-                            lamp.enable(False)
+                    if command.get('id', None) == unit_id :
+                        command_func = getattr(command_processor, command.get('type', ''), command_processor.noop)
+                        command_func(command['value'])
                 except queue.Empty :
                     pass
                 
