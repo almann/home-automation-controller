@@ -80,6 +80,9 @@ class State(object) :
     def update_lamp(self, is_on) :
         self.__update_state_field('lamp_state', is_on)
     @property
+    def lamp_last_updated_secs(self) :
+        return now_secs() - self.__state.get('lamp_state_time', 0.0)
+    @property
     def pir_last_updated_secs(self) :
         return now_secs() - self.__state.get('pir_state_time', 0.0)
     @property
@@ -175,11 +178,13 @@ def main(args) :
         class CommandProcessor(object) :
             def cmd_lamp(self, val) :
                 if val == 'on' :
-                    info('Turning on lamp via command')
-                    lamp.enable(True)
+                    if lamp.enable(True) :
+                        info('Turning on lamp via command')
+                        state.update_lamp(True)
                 elif val == 'off' :
-                    info('Turning off lamp via command')
-                    lamp.enable(False)
+                    if lamp.enable(False) :
+                        info('Turning off lamp via command')
+                        state.update_lamp(False)
                 else :
                     warn('Invalid lamp command value: %s' % val)
         command_processor = CommandProcessor()
@@ -199,7 +204,7 @@ def main(args) :
                     if not lamp.is_enabled :
                         if lamp.enable(True) :
                             info('Turning on lamp via motion')
-                        state.update_lamp(True)
+                            state.update_lamp(True)
 
                 elif event_count == 1 :
                     pir_led.enable(False)
@@ -233,6 +238,7 @@ def main(args) :
                     # turn off lamp
                     if state.pir_state == 'IDLE' \
                             and state.pir_last_updated_secs > _IDLE_AC_TURNOFF_TIME \
+                            and state.lamp_last_updated_secs > _IDLE_AC_TURNOFF_TIME \
                             and lamp.is_enabled:
                         info('Idle for %0.2fs, shutting off lamp' % state.pir_last_updated_secs)
                         lamp.enable(False)
