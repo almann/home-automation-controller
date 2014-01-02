@@ -28,7 +28,7 @@ from   logging              import error
 
 _AWS_REGION = "us-west-2"
 
-_AC_RELAY_PIN = 4
+_AC_RELAY_PIN = 17
 _AC_RELAY_MIN_TOGGLE_TIME = 5.0
 _PIR_PIN = 18
 _RED_LED_PIN = 23
