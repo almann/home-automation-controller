@@ -6,6 +6,8 @@ import datetime
 import json
 import traceback
 import zlib
+import glob
+import re
 
 import multiprocessing      as mp
 import Queue                as queue
@@ -28,16 +30,20 @@ from   logging              import error
 
 _AWS_REGION = "us-west-2"
 
-_AC_RELAY_PIN = 17
-_AC_RELAY_MIN_TOGGLE_TIME = 5.0
-_PIR_PIN = 18
-_RED_LED_PIN = 23
-_GREEN_LED_PIN = 24
-_SLEEP_TIME = 0.05
-_LOG_TIME = 5.0
-_LOG_FREQ = int(_LOG_TIME / _SLEEP_TIME)
+_AC_RELAY_PIN               = 17
+_AC_RELAY_MIN_TOGGLE_TIME   = 5.0
+_PIR_PIN                    = 18
+_RED_LED_PIN                = 23
+_GREEN_LED_PIN              = 24
 
-_IDLE_AC_TURNOFF_TIME = 180.0
+_TEMPERATURE_SLEEP_TIME     = 0.25
+_TEMPERATURE_TOLERANCE      = 0.25
+
+_SLEEP_TIME                 = 0.05
+_LOG_TIME                   = 5.0
+_LOG_FREQ                   = int(_LOG_TIME / _SLEEP_TIME)
+
+_IDLE_AC_TURNOFF_TIME               = 180.0
 
 _MAX_EVENTS = 100
 
@@ -69,16 +75,20 @@ class State(object) :
         self.__item['state'] = ddb_types.Binary(zlib.compress(json.dumps(self.__state)))
         self.__item['mtime'] = now_str()
         self.__item.save(overwrite = True)
-    def __update_state_field(self, field, flag) :
-        state_label = 'ACTIVE' if flag else 'IDLE'
-        if self.__state.get(field, None) != state_label :
-            self.__state[field] = state_label
+    def __update_value_field(self, field, value) :
+        if self.__state.get(field, None) != value :
+            self.__state[field] = value
             self.__state['%s_time' % field] = now_secs()
             self.__update_state()
+    def __update_state_field(self, field, flag) :
+        state_label = 'ACTIVE' if flag else 'IDLE'
+        self.__update_value_field(field, state_label)
     def update_motion(self, has_motion) :
         self.__update_state_field('pir_state', has_motion)
     def update_lamp(self, is_on) :
         self.__update_state_field('lamp_state', is_on)
+    def update_temperature(self, temperature) :
+        self.__update_value_field('temperature', temperature)
     @property
     def lamp_last_updated_secs(self) :
         return now_secs() - self.__state.get('lamp_state_time', 0.0)
@@ -88,6 +98,9 @@ class State(object) :
     @property
     def pir_state(self) :
         return self.__state.get('pir_state', None)
+    @property
+    def temperature(self) :
+        return self.__state.get('temperature', None)
 
 class Toggle(object) :
     '''Represents an output to a GPIO pin'''
@@ -121,6 +134,34 @@ def led_toggle(pin) :
 def ac_toggle(pin) :
     return Toggle(pin, _AC_RELAY_MIN_TOGGLE_TIME)
 
+_TEMP_DATA_PAT = re.compile(r't=(\d+)')
+
+def read_w1_temp() :
+    fnames = glob.glob('/sys/bus/w1/devices/28-*/w1_slave')
+    if len(fnames) == 0 :
+        raise Exception, 'No Wire-1 slaves detected'
+    debug('Found %d W1 slave files' % len(fnames))
+    with file(fnames[0], 'rb') as f :
+        header = f.readline().strip()
+        if not header.endswith('YES') :
+            return None
+        data = f.readline().strip()
+        temp_match = _TEMP_DATA_PAT.search(data)
+        if not temp_match :
+            raise Exception, 'Invalid data from temperature sensor: %s' % data
+        temp_c = int(temp_match.group(1)) / 1000.0
+        temp_f = temp_c * 1.8 + 32.0
+        return temp_f
+
+def temperature_proc_func(temperature_queue, termination_flag) :
+    '''Seperate process for reading temperature'''
+    while not termination_flag.value :
+        try :
+            temperature_queue.put(read_w1_temp())
+            time.sleep(_TEMPERATURE_SLEEP_TIME)
+        except :
+            error('Temperature loop error', exc_info = True)
+
 def command_proc_func(sqs_queue_name, control_queue, termination_flag) :
     '''Command queue for SQS commands'''
     info('Initializing SQS command processor...')
@@ -135,6 +176,33 @@ def command_proc_func(sqs_queue_name, control_queue, termination_flag) :
             control_queue.put(command)
             sqs_queue.delete_message(message)
 
+def spawn_process(target, args) :
+    proc = mp.Process(target = target, args = args)
+    proc.start()
+    return proc
+
+class Processes(object) :
+    def __init__(self) :
+        self.__termination_flag = mp.Value('l', 0)
+        self.__processes = []
+    def spawn(self, target, args) :
+        self.__processes.append(spawn_process(target, args))
+    @property
+    def termination_flag(self) :
+        return self.__termination_flag
+    def finish(self) :
+        self.__termination_flag.value = 1
+        for process in self.__processes :
+            process.join()
+
+def drain_queue(data_queue) :
+    values = []
+    try :
+        while True :
+            values.append(data_queue.get_nowait())
+    except queue.Empty :
+        pass
+    return values
 
 def main(args) :
     if len(args) != 4 :
@@ -151,15 +219,20 @@ def main(args) :
     command_queue_name = args[2]
     unit_id = args[3]
 
-    control_queue = mp.Queue()
-    termination_flag = mp.Value('l', 0)
 
+    processes = Processes()
     # spawn off command process
-    p_command = mp.Process(
+    control_queue = mp.Queue()
+    processes.spawn(
         target = command_proc_func,
-        args = (command_queue_name, control_queue, termination_flag)
+        args = (command_queue_name, control_queue, processes.termination_flag)
     )
-    p_command.start()
+    # spawn off temperature process
+    temperature_queue = mp.Queue()
+    processes.spawn(
+        target = temperature_proc_func,
+        args = (temperature_queue, processes.termination_flag)
+    )
 
     # operational table
     info('Initializing DDB backed operational state...')
@@ -192,6 +265,7 @@ def main(args) :
         # event loop
         event_count = 0
         motion_count = 0
+        temperatures = []
         info('Starting main event loop...')
         while True :
             try :
@@ -205,13 +279,14 @@ def main(args) :
                         if lamp.enable(True) :
                             info('Turning on lamp via motion')
                             state.update_lamp(True)
-
                 elif event_count == 1 :
                     pir_led.enable(False)
 
+                temperatures.extend(drain_queue(temperature_queue))
+
                 # get commands
-                try :
-                    command_str = control_queue.get_nowait()
+                command_strs = drain_queue(control_queue)
+                for command_str in command_strs :
                     info('Received command: %s' % command_str)
                     command = json.loads(command_str)
                     command_unit_id = command.get('id', None)
@@ -227,8 +302,6 @@ def main(args) :
                                 command_func(command['value'])
                     else :
                         info('Ignoring command for unit: %s' % command_unit_id)
-                except queue.Empty :
-                    pass
                 
                 # flush event
                 if event_count >= _LOG_FREQ :
@@ -247,6 +320,15 @@ def main(args) :
                     event_count = 0
                     motion_count = 0
 
+                    # record temperature
+                    if len(temperatures) > 0 :
+                        temperature = sum(temperatures) / len(temperatures)
+                        if state.temperature is None \
+                                or abs(state.temperature - temperature) > _TEMPERATURE_TOLERANCE :
+                            info('Detected temperature: %0.2f F' % temperature)
+                            state.update_temperature(temperature)
+                        del temperatures[:]
+
                 if error_led.is_enabled :
                     info('Event loop succeeded, switching error LED off')
                     error_led.enable(False)
@@ -257,8 +339,7 @@ def main(args) :
                 if sys.exc_info()[0] is KeyboardInterrupt :
                     raise sys.exc_info()[1]
     finally :
-        termination_flag.value = 1
-        p_command.join()
+        processes.finish()
         io.cleanup()
 
 if __name__ == '__main__' :
