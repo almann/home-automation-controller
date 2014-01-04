@@ -43,7 +43,8 @@ _LOG_FREQ                   = int(_LOG_TIME / _SLEEP_TIME)
 
 _TEMPERATURE_SLEEP_TIME     = 0.50
 _TEMPERATURE_TOLERANCE      = 0.25
-_TEMPERATURE_WINDOW_SIZE    = int(_LOG_TIME / _TEMPERATURE_SLEEP_TIME) * 2
+_TEMPERATURE_WINDOW_SIZE    = int(15 / _TEMPERATURE_SLEEP_TIME)
+_TEMPERATURE_EVENT_INTERVAL = 300
 
 _IDLE_AC_TURNOFF_TIME       = 180.0
 
@@ -347,6 +348,9 @@ def main(args) :
                                 or abs(state.temperature - temperature) > _TEMPERATURE_TOLERANCE :
                             info('Updating temperature state')
                             state.update_temperature(temperature)
+                        if state.temperature_event_last_updated_secs >= _TEMPERATURE_EVENT_INTERVAL :
+                            info('Adding temperature event')
+                            state.add_temperature_event(temperature)
 
                 if error_led.is_enabled :
                     info('Event loop succeeded, switching error LED off')
