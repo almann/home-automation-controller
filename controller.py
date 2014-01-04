@@ -8,6 +8,7 @@ import traceback
 import zlib
 import glob
 import re
+import collections
 
 import multiprocessing      as mp
 import Queue                as queue
@@ -28,7 +29,7 @@ from   logging              import debug
 from   logging              import info
 from   logging              import error
 
-_AWS_REGION = "us-west-2"
+_AWS_REGION                 = "us-west-2"
 
 _AC_RELAY_PIN               = 17
 _AC_RELAY_MIN_TOGGLE_TIME   = 5.0
@@ -36,16 +37,17 @@ _PIR_PIN                    = 18
 _RED_LED_PIN                = 23
 _GREEN_LED_PIN              = 24
 
-_TEMPERATURE_SLEEP_TIME     = 0.25
-_TEMPERATURE_TOLERANCE      = 0.25
-
 _SLEEP_TIME                 = 0.05
-_LOG_TIME                   = 5.0
+_LOG_TIME                   = 5.00
 _LOG_FREQ                   = int(_LOG_TIME / _SLEEP_TIME)
 
-_IDLE_AC_TURNOFF_TIME               = 180.0
+_TEMPERATURE_SLEEP_TIME     = 0.50
+_TEMPERATURE_TOLERANCE      = 0.25
+_TEMPERATURE_WINDOW_SIZE    = int(_LOG_TIME / _TEMPERATURE_SLEEP_TIME) * 2
 
-_MAX_EVENTS = 100
+_IDLE_AC_TURNOFF_TIME       = 180.0
+
+_MAX_EVENTS                 = 300
 
 def now_str() :
     return str(datetime.datetime.now())
@@ -89,6 +91,15 @@ class State(object) :
         self.__update_state_field('lamp_state', is_on)
     def update_temperature(self, temperature) :
         self.__update_value_field('temperature', temperature)
+    def add_temperature_event(self, temperature) :
+        events = self.__state.get('temperature_events', None)
+        if events is None :
+            events = []
+            self.__state['temperature_events'] = events
+        events.append(dict(temperature = temperature, time = now_secs()))
+        if len(events) > _MAX_EVENTS :
+            del events[0]
+        self.__update_state()
     @property
     def lamp_last_updated_secs(self) :
         return now_secs() - self.__state.get('lamp_state_time', 0.0)
@@ -101,6 +112,13 @@ class State(object) :
     @property
     def temperature(self) :
         return self.__state.get('temperature', None)
+    @property
+    def temperature_event_last_updated_secs(self) :
+        events = self.__state.get('temperature_events',[])
+        last_updated = 0.0
+        if len(events) > 0 :
+            last_updated = events[-1]['time']
+        return now_secs() - last_updated
 
 class Toggle(object) :
     '''Represents an output to a GPIO pin'''
@@ -265,7 +283,8 @@ def main(args) :
         # event loop
         event_count = 0
         motion_count = 0
-        temperatures = []
+        info('Temperature window size: %d' % _TEMPERATURE_WINDOW_SIZE)
+        temperatures = collections.deque(maxlen = _TEMPERATURE_WINDOW_SIZE)
         info('Starting main event loop...')
         while True :
             try :
@@ -323,11 +342,11 @@ def main(args) :
                     # record temperature
                     if len(temperatures) > 0 :
                         temperature = sum(temperatures) / len(temperatures)
+                        info('Detected temperature: %0.2f F' % temperature)
                         if state.temperature is None \
                                 or abs(state.temperature - temperature) > _TEMPERATURE_TOLERANCE :
-                            info('Detected temperature: %0.2f F' % temperature)
+                            info('Updating temperature state')
                             state.update_temperature(temperature)
-                        del temperatures[:]
 
                 if error_led.is_enabled :
                     info('Event loop succeeded, switching error LED off')
