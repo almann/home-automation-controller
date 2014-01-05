@@ -41,20 +41,31 @@ _SLEEP_TIME                 = 0.05
 _LOG_TIME                   = 5.00
 _LOG_FREQ                   = int(_LOG_TIME / _SLEEP_TIME)
 
-_TEMPERATURE_SLEEP_TIME              = 0.50
-_TEMPERATURE_TOLERANCE               = 0.25
-_TEMPERATURE_WINDOW_SIZE             = int(15 / _TEMPERATURE_SLEEP_TIME)
-_TEMPERATURE_EVENT_INTERVAL          = 600
+_TEMPERATURE_SLEEP_TIME     = 0.50
+_TEMPERATURE_TOLERANCE      = 0.25
+_TEMPERATURE_WINDOW_SIZE    = int(15 / _TEMPERATURE_SLEEP_TIME)
+_TEMPERATURE_EVENT_INTERVAL = 600
 
 _IDLE_AC_TURNOFF_TIME       = 180.0
 
-_MAX_EVENTS                 = 150
+_MAX_EVENTS                 = 100
+
+_HOUR_IN_SECS               = 3600
+_20MIN_IN_SECS              = 1200
 
 def now_str() :
     return str(datetime.datetime.now())
 
 def now_secs() :
     return time.time()
+
+_EPOCH_DT = datetime.datetime.utcfromtimestamp(0)
+
+def datetime_secs(dt) :
+    return (dt - _EPOCH_DT).total_seconds()
+
+def avg(sequence) :
+    return sum(sequence) / float(len(sequence))
 
 class State(object) :
     '''Controller state'''
@@ -76,7 +87,7 @@ class State(object) :
             self.__state = json.loads(zlib.decompress(state_data.value))
     def __update_state(self) :
         self.__item['state'] = ddb_types.Binary(zlib.compress(json.dumps(self.__state)))
-        self.__item['mtime'] = now_str()
+        self.__item['mtime'] = now_secs()
         self.__item.save(overwrite = True)
     def __update_value_field(self, field, value) :
         if self.__state.get(field, None) != value :
@@ -92,14 +103,74 @@ class State(object) :
         self.__update_state_field('lamp_state', is_on)
     def update_temperature(self, temperature) :
         self.__update_value_field('temperature', temperature)
+    def __collapse_events(self, events, event_field, period = _20MIN_IN_SECS, redzone_interval = _HOUR_IN_SECS) :
+        if _HOUR_IN_SECS % period != 0 :
+            raise Exception, 'Hour must be divisible by collapse period: %s' % period
+        if period > _HOUR_IN_SECS :
+            raise Exception, 'Period must be <= 1 hour: %s' % period
+        
+        redzone_dt = datetime.datetime.utcnow() - datetime.timedelta(seconds = redzone_interval)
+        
+        class Group(object) :
+            def __init__(self, start_dt) :
+                self.start_dt = start_dt
+                self.end_dt = start_dt + datetime.timedelta(seconds = period)
+                self.events = []
+            def add(self, event) :
+                event['period'] = period
+                self.events.append(event)
+            def contains(self, dt) :
+                return dt >= self.start_dt and dt < self.end_dt
+
+        slots_per_hour = int(_HOUR_IN_SECS / period)
+        period_mins = period / 60
+        def nearest_period(dt) :
+            hour_dt = dt.replace(minute = 0, second = 0, microsecond = 0)
+            slot = int(float(dt.minute) / 60.0 * slots_per_hour)
+            period_dt = hour_dt.replace(minute = period_mins * slot)
+            return period_dt
+
+        def flush_group(curr_group, new_events) :
+            if curr_group is not None and len(curr_group.events) > 0:
+                collapsed_event = {
+                    event_field : avg(map(lambda e : e[event_field], curr_group.events)),
+                    'time' :      datetime_secs(curr_group.start_dt),
+                    'period' :    period,
+                    'count' :     len(curr_group.events)
+                }
+                new_events.append(collapsed_event)
+
+        new_events = []
+        curr_group = None
+        for event in events :
+            if event.get('period', None) == period :
+                # move along, already collapsed
+                new_events.append(event)
+                continue
+            event_dt = datetime.datetime.utcfromtimestamp(event['time'])
+            period_dt = nearest_period(event_dt)
+            if curr_group is None or curr_group.start_dt != period_dt :
+                flush_group(curr_group, new_events)
+                curr_group = Group(period_dt)
+            # at this point we have an appropriate collapse group
+            if curr_group.end_dt <= redzone_dt :
+                curr_group.add(event.copy())
+            else :
+                # the current group is invalid
+                new_events.append(event)
+
+        return new_events
+            
     def add_temperature_event(self, temperature) :
         events = self.__state.get('temperature_events', None)
         if events is None :
             events = []
-            self.__state['temperature_events'] = events
         events.append(dict(temperature = temperature, time = now_secs()))
+        events = self.__collapse_events(events, 'temperature')
+        # store new event state
         if len(events) > _MAX_EVENTS :
             del events[0 : (len(events) - _MAX_EVENTS)]
+        self.__state['temperature_events'] = events
         self.__update_state()
     @property
     def lamp_last_updated_secs(self) :
