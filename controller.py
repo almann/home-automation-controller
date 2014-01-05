@@ -41,10 +41,10 @@ _SLEEP_TIME                 = 0.05
 _LOG_TIME                   = 5.00
 _LOG_FREQ                   = int(_LOG_TIME / _SLEEP_TIME)
 
-_TEMPERATURE_SLEEP_TIME     = 0.50
-_TEMPERATURE_TOLERANCE      = 0.25
-_TEMPERATURE_WINDOW_SIZE    = int(15 / _TEMPERATURE_SLEEP_TIME)
-_TEMPERATURE_EVENT_INTERVAL = 300
+_TEMPERATURE_SLEEP_TIME              = 0.50
+_TEMPERATURE_TOLERANCE               = 0.25
+_TEMPERATURE_WINDOW_SIZE             = int(15 / _TEMPERATURE_SLEEP_TIME)
+_TEMPERATURE_EVENT_INTERVAL          = 300
 
 _IDLE_AC_TURNOFF_TIME       = 180.0
 
@@ -99,7 +99,7 @@ class State(object) :
             self.__state['temperature_events'] = events
         events.append(dict(temperature = temperature, time = now_secs()))
         if len(events) > _MAX_EVENTS :
-            del events[0]
+            del events[0 : (_MAX_EVENTS - len(events))]
         self.__update_state()
     @property
     def lamp_last_updated_secs(self) :
