@@ -138,6 +138,7 @@ class State(object) :
                     'period' :    period,
                     'count' :     len(curr_group.events)
                 }
+                info('Collapsing group %s, %d records' % (curr_group.start_dt, len(curr_group.events)))
                 new_events.append(collapsed_event)
 
         new_events = []
@@ -152,12 +153,14 @@ class State(object) :
             if curr_group is None or curr_group.start_dt != period_dt :
                 flush_group(curr_group, new_events)
                 curr_group = Group(period_dt)
-            # at this point we have an appropriate collapse group
             if curr_group.end_dt <= redzone_dt :
+                # at this point we have an appropriate collapse group
                 curr_group.add(event.copy())
             else :
                 # the current group is invalid
                 new_events.append(event)
+        # should be a no-op
+        flush_group(curr_group, new_events)
 
         return new_events
             
