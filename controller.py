@@ -9,6 +9,7 @@ import zlib
 import glob
 import re
 import collections
+import subprocess
 
 import multiprocessing      as mp
 import Queue                as queue
@@ -41,17 +42,22 @@ _SLEEP_TIME                 = 0.05
 _LOG_TIME                   = 5.00
 _LOG_FREQ                   = int(_LOG_TIME / _SLEEP_TIME)
 
+_HOUR_IN_SECS               = 3600
+_20MIN_IN_SECS              = 1200
+
 _TEMPERATURE_SLEEP_TIME     = 0.50
 _TEMPERATURE_TOLERANCE      = 0.25
 _TEMPERATURE_WINDOW_SIZE    = int(15 / _TEMPERATURE_SLEEP_TIME)
-_TEMPERATURE_EVENT_INTERVAL = 600
+_TEMPERATURE_EVENT_INTERVAL = 300
+_TEMPERATURE_MAX_EVENTS     = 100
+
+_NOISE_SLEEP_TIME           = 0.50
+_NOISE_TOLERANCE            = 0.01
+_NOISE_WINDOW_SIZE          = 5
+_NOISE_EVENT_INTERVAL       = 120
+_NOISE_MAX_EVENTS           = 100
 
 _IDLE_AC_TURNOFF_TIME       = 180.0
-
-_MAX_EVENTS                 = 100
-
-_HOUR_IN_SECS               = 3600
-_20MIN_IN_SECS              = 1200
 
 def now_str() :
     return str(datetime.datetime.now())
@@ -103,6 +109,8 @@ class State(object) :
         self.__update_state_field('lamp_state', is_on)
     def update_temperature(self, temperature) :
         self.__update_value_field('temperature', temperature)
+    def update_noise(self, noise) :
+        self.__update_value_field('noise', noise)
     def __collapse_events(self, events, event_field, period = _20MIN_IN_SECS, redzone_interval = _HOUR_IN_SECS) :
         if _HOUR_IN_SECS % period != 0 :
             raise Exception, 'Hour must be divisible by collapse period: %s' % period
@@ -163,18 +171,27 @@ class State(object) :
         flush_group(curr_group, new_events)
 
         return new_events
-            
-    def add_temperature_event(self, temperature) :
-        events = self.__state.get('temperature_events', None)
+    def __add_event(self, field_name, value_name, value, max_events, period = _20MIN_IN_SECS, redzone_interval = _HOUR_IN_SECS) :
+        events = self.__state.get(field_name, None)
         if events is None :
             events = []
-        events.append(dict(temperature = temperature, time = now_secs()))
-        events = self.__collapse_events(events, 'temperature')
+        events.append({value_name : value, 'time' : now_secs()})
+        events = self.__collapse_events(events, value_name)
         # store new event state
-        if len(events) > _MAX_EVENTS :
-            del events[0 : (len(events) - _MAX_EVENTS)]
-        self.__state['temperature_events'] = events
+        if len(events) > max_events :
+            del events[0 : (len(events) - max_events)]
+        self.__state[field_name] = events
         self.__update_state()
+    def add_temperature_event(self, temperature) :
+        self.__add_event('temperature_events', 'temperature', temperature, _TEMPERATURE_MAX_EVENTS)
+    def add_noise_event(self, noise) :
+        self.__add_event('noise_events', 'noise', noise, _NOISE_MAX_EVENTS)
+    def __get_last_event_updated_secs(self, event_field) :
+        events = self.__state.get(event_field, [])
+        last_updated = 0.0
+        if len(events) > 0 :
+            last_updated = events[-1]['time']
+        return now_secs() - last_updated
     @property
     def lamp_last_updated_secs(self) :
         return now_secs() - self.__state.get('lamp_state_time', 0.0)
@@ -189,11 +206,13 @@ class State(object) :
         return self.__state.get('temperature', None)
     @property
     def temperature_event_last_updated_secs(self) :
-        events = self.__state.get('temperature_events',[])
-        last_updated = 0.0
-        if len(events) > 0 :
-            last_updated = events[-1]['time']
-        return now_secs() - last_updated
+        return self.__get_last_event_updated_secs('temperature_events')
+    @property
+    def noise(self) :
+        return self.__state.get('noise', None)
+    @property
+    def noise_event_last_updated_secs(self) :
+        return self.__get_last_event_updated_secs('noise_events')
 
 class Toggle(object) :
     '''Represents an output to a GPIO pin'''
@@ -246,6 +265,23 @@ def read_w1_temp() :
         temp_f = temp_c * 1.8 + 32.0
         return temp_f
 
+
+_SCRATCH_FILE_NAME = '/dev/shm/home-controller-arecord.wav'
+_ARECORD_CMD = ('arecord', '-q', '-D', 'plughw:1', '--duration=1', _SCRATCH_FILE_NAME)
+_SOX_CMD = ('/usr/bin/sox', '-q', _SCRATCH_FILE_NAME, '-n', 'stat')
+_MAX_AMPLITUDE_PAT = re.compile(r'Maximum amplitude:\s+([0-9.]+)', re.M | re.S)
+
+def read_noise() :
+    subprocess.check_call(_ARECORD_CMD)
+    noise_data = subprocess.check_output(_SOX_CMD, stderr = subprocess.STDOUT)
+    match = _MAX_AMPLITUDE_PAT.search(noise_data)
+    if not match :
+        raise Exception, 'Malformed amplitude data from sox'
+    noise_amplitude = float(match.group(1))
+    return noise_amplitude
+
+# TODO refactor the processor loop functions to hoist the loop/error handling out
+
 def temperature_proc_func(temperature_queue, termination_flag) :
     '''Seperate process for reading temperature'''
     while not termination_flag.value :
@@ -255,6 +291,16 @@ def temperature_proc_func(temperature_queue, termination_flag) :
         except :
             error('Temperature loop error', exc_info = True)
 
+def noise_proc_func(noise_queue, termination_flag) :
+    '''Seperate process for processing ambient environment noise'''
+    while not termination_flag.value :
+        try :
+            noise_queue.put(read_noise())
+            time.sleep(_NOISE_SLEEP_TIME)
+        except :
+            error('Noise loop error', exc_info = True)
+
+
 def command_proc_func(sqs_queue_name, control_queue, termination_flag) :
     '''Command queue for SQS commands'''
     info('Initializing SQS command processor...')
@@ -262,12 +308,15 @@ def command_proc_func(sqs_queue_name, control_queue, termination_flag) :
     sqs_queue = sqs_conn.get_queue(sqs_queue_name)
     sqs_queue.set_message_class(sqs.message.RawMessage)
     while not termination_flag.value :
-        messages = sqs_queue.get_messages(10, wait_time_seconds = 20)
-        info('Read %d messages from SQS' % len(messages))
-        for message in messages :
-            command = message.get_body()
-            control_queue.put(command)
-            sqs_queue.delete_message(message)
+        try :
+            messages = sqs_queue.get_messages(10, wait_time_seconds = 20)
+            info('Read %d messages from SQS' % len(messages))
+            for message in messages :
+                command = message.get_body()
+                control_queue.put(command)
+                sqs_queue.delete_message(message)
+        except :
+            error('SQS loop error', exc_info = True)
 
 def spawn_process(target, args) :
     proc = mp.Process(target = target, args = args)
@@ -297,6 +346,18 @@ def drain_queue(data_queue) :
         pass
     return values
 
+class WindowAverage(object) :
+    def __init__(self, window_size) :
+        self.__queue = collections.deque(maxlen = window_size)
+    def add(self, value) :
+        self.__queue.append(value)
+    def add_batch(self, values) :
+        self.__queue.extend(values)
+    def average(self) :
+        if len(self.__queue) == 0 :
+            return None
+        return sum(self.__queue) / len(self.__queue)
+
 def main(args) :
     if len(args) != 4 :
         print >> sys.stderr, 'USAGE: %s TABLE QUEUE ID' % args[0]
@@ -325,6 +386,12 @@ def main(args) :
     processes.spawn(
         target = temperature_proc_func,
         args = (temperature_queue, processes.termination_flag)
+    )
+    # spawn off noise process
+    noise_queue = mp.Queue()
+    processes.spawn(
+        target = noise_proc_func,
+        args = (noise_queue, processes.termination_flag)
     )
 
     # operational table
@@ -359,7 +426,9 @@ def main(args) :
         event_count = 0
         motion_count = 0
         info('Temperature window size: %d' % _TEMPERATURE_WINDOW_SIZE)
-        temperatures = collections.deque(maxlen = _TEMPERATURE_WINDOW_SIZE)
+        temperatures = WindowAverage(_TEMPERATURE_WINDOW_SIZE)
+        info('Noise window size: %d' % _NOISE_WINDOW_SIZE)
+        noises = WindowAverage(_NOISE_WINDOW_SIZE)
         info('Starting main event loop...')
         while True :
             try :
@@ -376,7 +445,8 @@ def main(args) :
                 elif event_count == 1 :
                     pir_led.enable(False)
 
-                temperatures.extend(drain_queue(temperature_queue))
+                temperatures.add_batch(drain_queue(temperature_queue))
+                noises.add_batch(drain_queue(noise_queue))
 
                 # get commands
                 command_strs = drain_queue(control_queue)
@@ -415,8 +485,8 @@ def main(args) :
                     motion_count = 0
 
                     # record temperature
-                    if len(temperatures) > 0 :
-                        temperature = sum(temperatures) / len(temperatures)
+                    temperature = temperatures.average()
+                    if temperature is not None :
                         info('Detected temperature: %0.2f F' % temperature)
                         if state.temperature is None \
                                 or abs(state.temperature - temperature) > _TEMPERATURE_TOLERANCE :
@@ -425,6 +495,19 @@ def main(args) :
                         if state.temperature_event_last_updated_secs >= _TEMPERATURE_EVENT_INTERVAL :
                             info('Adding temperature event')
                             state.add_temperature_event(temperature)
+
+                    # record noise
+                    noise = noises.average()
+                    if noise is not None :
+                        info('Detected noise amplitude: %0.6f amplitude' % noise)
+                        if state.noise is None \
+                                or abs(state.noise - noise) > _NOISE_TOLERANCE :
+                            info('Updating noise state')
+                            state.update_noise(noise)
+                        if state.noise_event_last_updated_secs >= _NOISE_EVENT_INTERVAL :
+                            info('Adding noise event')
+                            state.add_noise_event(noise)
+
 
                 if error_led.is_enabled :
                     info('Event loop succeeded, switching error LED off')
