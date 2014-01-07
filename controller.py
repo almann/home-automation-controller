@@ -43,19 +43,27 @@ _LOG_TIME                   = 5.00
 _LOG_FREQ                   = int(_LOG_TIME / _SLEEP_TIME)
 
 _HOUR_IN_SECS               = 3600
+_15MIN_IN_SECS              = 900
 _20MIN_IN_SECS              = 1200
+_30MIN_IN_SECS              = 1800
 
 _TEMPERATURE_SLEEP_TIME     = 0.50
 _TEMPERATURE_TOLERANCE      = 0.25
 _TEMPERATURE_WINDOW_SIZE    = int(15 / _TEMPERATURE_SLEEP_TIME)
-_TEMPERATURE_EVENT_INTERVAL = 300
-_TEMPERATURE_MAX_EVENTS     = 100
+
+_TEMPERATURE_EVENT_INTERVAL = 120
+_TEMPERATURE_MAX_EVENTS     = 65
+_TEMPERATURE_EVENT_REDZONE  = _30MIN_IN_SECS
+_TEMPERATURE_EVENT_COLLAPSE = _30MIN_IN_SECS
 
 _NOISE_SLEEP_TIME           = 0.50
 _NOISE_TOLERANCE            = 0.01
 _NOISE_WINDOW_SIZE          = 5
+
 _NOISE_EVENT_INTERVAL       = 120
-_NOISE_MAX_EVENTS           = 100
+_NOISE_MAX_EVENTS           = 160
+_NOISE_EVENT_REDZONE        = 2 * _HOUR_IN_SECS
+_NOISE_EVENT_COLLAPSE       = _15MIN_IN_SECS
 
 _IDLE_AC_TURNOFF_TIME       = 180.0
 
@@ -70,7 +78,7 @@ _EPOCH_DT = datetime.datetime.utcfromtimestamp(0)
 def datetime_secs(dt) :
     return (dt - _EPOCH_DT).total_seconds()
 
-def avg(sequence) :
+def average(sequence) :
     return sum(sequence) / float(len(sequence))
 
 class State(object) :
@@ -111,7 +119,10 @@ class State(object) :
         self.__update_value_field('temperature', temperature)
     def update_noise(self, noise) :
         self.__update_value_field('noise', noise)
-    def __collapse_events(self, events, event_field, period = _20MIN_IN_SECS, redzone_interval = _HOUR_IN_SECS) :
+    def __collapse_events(self,
+                          events, event_field,
+                          period = _20MIN_IN_SECS, redzone_interval = _HOUR_IN_SECS,
+                          combiner_func = average) :
         if _HOUR_IN_SECS % period != 0 :
             raise Exception, 'Hour must be divisible by collapse period: %s' % period
         if period > _HOUR_IN_SECS :
@@ -141,7 +152,7 @@ class State(object) :
         def flush_group(curr_group, new_events) :
             if curr_group is not None and len(curr_group.events) > 0:
                 collapsed_event = {
-                    event_field : avg(map(lambda e : e[event_field], curr_group.events)),
+                    event_field : combiner_func(map(lambda e : e[event_field], curr_group.events)),
                     'time' :      datetime_secs(curr_group.start_dt),
                     'period' :    period,
                     'count' :     len(curr_group.events)
@@ -171,21 +182,33 @@ class State(object) :
         flush_group(curr_group, new_events)
 
         return new_events
-    def __add_event(self, field_name, value_name, value, max_events, period = _20MIN_IN_SECS, redzone_interval = _HOUR_IN_SECS) :
+    def __add_event(self,
+                    field_name, value_name, value,
+                    max_events,
+                    period = _20MIN_IN_SECS, redzone_interval = _HOUR_IN_SECS,
+                    combiner_func = average) :
         events = self.__state.get(field_name, None)
         if events is None :
             events = []
         events.append({value_name : value, 'time' : now_secs()})
-        events = self.__collapse_events(events, value_name)
+        events = self.__collapse_events(events, value_name, combiner_func)
         # store new event state
         if len(events) > max_events :
             del events[0 : (len(events) - max_events)]
         self.__state[field_name] = events
         self.__update_state()
     def add_temperature_event(self, temperature) :
-        self.__add_event('temperature_events', 'temperature', temperature, _TEMPERATURE_MAX_EVENTS)
+        self.__add_event(
+            'temperature_events', 'temperature', temperature,
+            _TEMPERATURE_MAX_EVENTS, _TEMPERATURE_EVENT_COLLAPSE, _TEMPERATURE_EVENT_REDZONE,
+            average
+        )
     def add_noise_event(self, noise) :
-        self.__add_event('noise_events', 'noise', noise, _NOISE_MAX_EVENTS)
+        self.__add_event(
+            'noise_events', 'noise', noise,
+            _NOISE_MAX_EVENTS, _NOISE_EVENT_COLLAPSE, _NOISE_EVENT_REDZONE,
+            max
+        )
     def __get_last_event_updated_secs(self, event_field) :
         events = self.__state.get(event_field, [])
         last_updated = 0.0
