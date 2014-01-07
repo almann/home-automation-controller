@@ -191,7 +191,7 @@ class State(object) :
         if events is None :
             events = []
         events.append({value_name : value, 'time' : now_secs()})
-        events = self.__collapse_events(events, value_name, combiner_func)
+        events = self.__collapse_events(events, value_name, period, redzone_interval, combiner_func)
         # store new event state
         if len(events) > max_events :
             del events[0 : (len(events) - max_events)]
