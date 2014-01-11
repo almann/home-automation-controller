@@ -303,48 +303,40 @@ def read_noise() :
     noise_amplitude = float(match.group(1))
     return noise_amplitude
 
-# TODO refactor the processor loop functions to hoist the loop/error handling out
+def temperature_looper(temperature_queue) :
+    return lambda : temperature_queue.put(read_w1_temp())
 
-def temperature_proc_func(temperature_queue, termination_flag) :
-    '''Seperate process for reading temperature'''
-    while not termination_flag.value :
-        try :
-            temperature_queue.put(read_w1_temp())
-            time.sleep(_TEMPERATURE_SLEEP_TIME)
-        except :
-            error('Temperature loop error', exc_info = True)
+def noise_looper(noise_queue) :
+    return lambda : noise_queue.put(read_noise())
 
-def noise_proc_func(noise_queue, termination_flag) :
-    '''Seperate process for processing ambient environment noise'''
-    while not termination_flag.value :
-        try :
-            noise_queue.put(read_noise())
-            time.sleep(_NOISE_SLEEP_TIME)
-        except :
-            error('Noise loop error', exc_info = True)
-
-
-def command_proc_func(sqs_queue_name, control_queue, termination_flag) :
-    '''Command queue for SQS commands'''
+def command_looper(sqs_queue_name, control_queue) :
     info('Initializing SQS command processor...')
     sqs_conn = sqs.connect_to_region(_AWS_REGION)
     sqs_queue = sqs_conn.get_queue(sqs_queue_name)
     sqs_queue.set_message_class(sqs.message.RawMessage)
-    while not termination_flag.value :
-        try :
-            messages = sqs_queue.get_messages(10, wait_time_seconds = 20)
-            info('Read %d messages from SQS' % len(messages))
-            for message in messages :
-                command = message.get_body()
-                control_queue.put(command)
-                sqs_queue.delete_message(message)
-        except :
-            error('SQS loop error', exc_info = True)
+    def command_proc_loop() :
+        messages = sqs_queue.get_messages(10, wait_time_seconds = 20)
+        info('Read %d messages from SQS' % len(messages))
+        for message in messages :
+            command = message.get_body()
+            control_queue.put(command)
+            sqs_queue.delete_message(message)
+    return command_proc_loop
 
 def spawn_process(target, args) :
     proc = mp.Process(target = target, args = args)
     proc.start()
     return proc
+
+def process_loop(looper, termination_flag, sleep_time, *args) :
+    loop_func = looper(*args)
+    while not termination_flag.value :
+        try :
+            loop_func()
+            if sleep_time is not None :
+                time.sleep(sleep_time)
+        except :
+            error('%s loop error' % loop_func.__name__, exc_info = True)
 
 class Processes(object) :
     def __init__(self) :
@@ -352,6 +344,8 @@ class Processes(object) :
         self.__processes = []
     def spawn(self, target, args) :
         self.__processes.append(spawn_process(target, args))
+    def spawn_loop(self, looper, sleep_time, args) :
+        self.spawn(process_loop, args = (looper, self.__termination_flag, sleep_time) + args)
     @property
     def termination_flag(self) :
         return self.__termination_flag
@@ -400,21 +394,24 @@ def main(args) :
     processes = Processes()
     # spawn off command process
     control_queue = mp.Queue()
-    processes.spawn(
-        target = command_proc_func,
-        args = (command_queue_name, control_queue, processes.termination_flag)
+    processes.spawn_loop(
+        looper = command_looper,
+        sleep_time = None,
+        args = (command_queue_name, control_queue)
     )
     # spawn off temperature process
     temperature_queue = mp.Queue()
-    processes.spawn(
-        target = temperature_proc_func,
-        args = (temperature_queue, processes.termination_flag)
+    processes.spawn_loop(
+        looper = temperature_looper,
+        sleep_time = _TEMPERATURE_SLEEP_TIME,
+        args = (temperature_queue,)
     )
     # spawn off noise process
     noise_queue = mp.Queue()
-    processes.spawn(
-        target = noise_proc_func,
-        args = (noise_queue, processes.termination_flag)
+    processes.spawn_loop(
+        looper = noise_looper,
+        sleep_time = _NOISE_SLEEP_TIME,
+        args = (noise_queue,)
     )
 
     # operational table
