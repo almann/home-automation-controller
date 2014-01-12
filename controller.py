@@ -374,6 +374,29 @@ class WindowAverage(object) :
         if len(self.__queue) == 0 :
             return None
         return sum(self.__queue) / len(self.__queue)
+    def clear(self) :
+        self.__queue.clear()
+
+class CumulativeWindowAverage(object) :
+    def __init__(self, window_size, cumulative_max = 256) :
+        self.__window_average = WindowAverage(window_size)
+        self.__cumulative_average = WindowAverage(cumulative_max)
+    def add(self, value) :
+        self.__window_average.add(value)
+    def add_batch(self, values) :
+        self.__window_average.add_batch(values)
+    def average(self) :
+        value = self.__window_average.average()
+        if value is not None :
+            self.__cumulative_average.add(value)
+        return value
+    def flush_cumulative_average(self) :
+        value = self.__cumulative_average.average()
+        self.__cumulative_average.clear()
+        return value
+    def clear(self) :
+        self.__window_average.clear()
+        self.__collapse_events.clear()
 
 def main(args) :
     if len(args) != 4 :
@@ -446,9 +469,9 @@ def main(args) :
         event_count = 0
         motion_count = 0
         info('Temperature window size: %d' % _TEMPERATURE_WINDOW_SIZE)
-        temperatures = WindowAverage(_TEMPERATURE_WINDOW_SIZE)
+        temperatures = CumulativeWindowAverage(_TEMPERATURE_WINDOW_SIZE)
         info('Noise window size: %d' % _NOISE_WINDOW_SIZE)
-        noises = WindowAverage(_NOISE_WINDOW_SIZE)
+        noises = CumulativeWindowAverage(_NOISE_WINDOW_SIZE)
         info('Starting main event loop...')
         while True :
             try :
@@ -513,20 +536,22 @@ def main(args) :
                             info('Updating temperature state')
                             state.update_temperature(temperature)
                         if state.temperature_event_last_updated_secs >= _TEMPERATURE_EVENT_INTERVAL :
-                            info('Adding temperature event')
-                            state.add_temperature_event(temperature)
+                            event_temperature = temperatures.flush_cumulative_average()
+                            info('Adding temperature event: %0.2f F' % event_temperature)
+                            state.add_temperature_event(event_temperature)
 
                     # record noise
                     noise = noises.average()
                     if noise is not None :
-                        info('Detected noise amplitude: %0.6f amplitude' % noise)
+                        info('Detected noise amplitude: %0.3f amplitude' % noise)
                         if state.noise is None \
                                 or abs(state.noise - noise) > _NOISE_TOLERANCE :
                             info('Updating noise state')
                             state.update_noise(noise)
                         if state.noise_event_last_updated_secs >= _NOISE_EVENT_INTERVAL :
-                            info('Adding noise event')
-                            state.add_noise_event(noise)
+                            event_noise = noises.flush_cumulative_average()
+                            info('Adding noise event: %0.3f amplitude' % event_noise)
+                            state.add_noise_event(event_noise)
 
 
                 if error_led.is_enabled :
