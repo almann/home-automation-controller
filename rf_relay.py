@@ -122,12 +122,13 @@ def main(args) :
                         continue
 
                     command_type = command.get('type', None)
-                    if command_type == None :
+                    if command_type is None :
                         warn('No command type specified')
                         continue
                     
                     info('Received command type: %r' % command_type)
-                    if not isinstance(command_type, (int, long)) or command_type < 0 or command_type >= len(codes):
+                    code_pair = codes.get(command_type, None)
+                    if code_pair is None:
                         warn('Invalid command type')
                         continue
 
@@ -141,7 +142,7 @@ def main(args) :
                         warn('Unknown command value: %r' % value)
                         continue
                     
-                    code = codes[command_type][idx]
+                    code = code_pair[idx]
                     info('Executing RF code: %d' % code)
                     subprocess.check_call([codesend_cmd, str(code)])
                 
